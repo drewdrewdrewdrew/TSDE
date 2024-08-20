@@ -24,6 +24,8 @@
 
 ------
 
+:triangular_flag_on_post:**News** (2024.08) TSDE is applied to company financial forecasting for Private Equity industry. See the [Blog Post](https://motherbrain.ai/advanced-financial-forecasting-for-portfolio-performance-61a93e55d46b).
+
 :triangular_flag_on_post:**News** (2024.06) We have added scripts to run forecasting experiments on the Electricity dataset provided by [TimesNet](https://github.com/thuml/Time-Series-Library).
 
 :triangular_flag_on_post:**News** (2024.05) This work is accepted at KDD 2024, to main research track.
