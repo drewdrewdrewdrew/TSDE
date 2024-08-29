@@ -18,6 +18,7 @@
   <a href="#examples">Examples</a> •
   <a href="#checkpoints">Checkpoints</a> •
   <a href="https://storage.googleapis.com/motherbrain-tsde/Datasets.zip">Processed Datasets</a> •
+  <a href="https://dl.acm.org/doi/10.1145/3637528.3671673">KDD2024 Publication</a> •
   <a href="#citation">Citation</a>
 </p>
 </div>
