@@ -48,13 +48,14 @@ def interpolation_mask_batch(observed_mask):
     return cond_mask
     
 
-def forecasting_mask_batch(observed_mask):
+def forecasting_mask_batch(observed_mask, nowcast_cols=None):
     """
     Generates a batch of masks for forecasting task by masking out all future values beyond a randomly selected start
     point in the sequence (30% timestamps at most).
     
     Parameters:
     - observed_mask (Tensor): A tensor indicating observed values.
+    - nowcast_cols (List): A list of feature indices to keep unmasked.
     
     Returns:
     - Tensor: A mask tensor for forecasting tasks.
@@ -69,6 +70,11 @@ def forecasting_mask_batch(observed_mask):
         )
         rand_for_mask[i][:,-start_forecast_mask:] = -1
     cond_mask = (rand_for_mask > 0).float()
+
+    # now unmask the features in keep_idx
+    if nowcast_cols is not None:
+        cond_mask[:, -nowcast_cols:, :] = 1
+
     return cond_mask
     
 
