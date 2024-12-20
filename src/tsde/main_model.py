@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from base.denoisingNetwork import diff_Block
 from base.mtsEmbedding import embedding_MTS
 
-from utils.masking_strategies import get_mask_probabilistic_layering, get_mask_equal_p_sample, imputation_mask_batch, pattern_mask_batch, interpolation_mask_batch
+from utils.masking_strategies import get_mask_probabilistic_layering, get_mask_equal_p_sample, imputation_mask_batch, pattern_mask_batch, interpolation_mask_batch, forecasting_mask_batch
 
 
 class TSDE_base(nn.Module):
@@ -186,33 +186,43 @@ class TSDE_base(nn.Module):
 
     def impute(self, observed_data, cond_mask, mts_emb, n_samples):
         B, K, L = observed_data.shape
-
         imputed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
-        
+        # print('    imputed_samples:', imputed_samples.shape, torch.isinf(imputed_samples).sum())
         for i in range(n_samples):
 
             current_sample = torch.randn_like(observed_data)
-
+            # if torch.isinf(current_sample).sum() > 0:
+            #     print(i)
+            #     print('     observed_data:', observed_data.dtype, observed_data.shape, torch.isinf(observed_data).sum(), torch.isnan(observed_data).sum())
+            #     print('    current_sample:', current_sample.dtype, current_sample.shape, torch.isinf(current_sample).sum(), torch.isnan(current_sample).sum())
+            #     print(observed_data)
+            #     print(current_sample)
+            #     break
+            # # print('    current_sample:', current_sample.shape, torch.isinf(current_sample).sum())
             for t in range(self.num_steps - 1, -1, -1):
                 cond_obs = (cond_mask * observed_data).unsqueeze(1)
                 noisy_target = ((1 - cond_mask) * current_sample).unsqueeze(1)
-                
-                predicted= self.diffmodel(noisy_target, mts_emb, torch.tensor([t]).to(self.device))
+                predicted = self.diffmodel(noisy_target, mts_emb, torch.tensor([t]).to(self.device))
+                # print('    cond_obs:', cond_obs.shape, torch.isinf(cond_obs).sum())
+                # print('    noisy_target:', noisy_target.shape, torch.isinf(noisy_target).sum())
+                # print('    predicted:', predicted.shape, torch.isinf(predicted).sum())
                 coeff1 = 1 / self.alpha_hat[t] ** 0.5
                 coeff2 = (1 - self.alpha_hat[t]) / (1 - self.alpha[t]) ** 0.5
                 current_sample = coeff1 * (current_sample - coeff2 * predicted)
-
+                # print('    current_sample1:', current_sample.shape, torch.isinf(current_sample).sum())
                 if t > 0:
                     noise = torch.randn_like(current_sample)
                     sigma = (
                         (1.0 - self.alpha[t - 1]) / (1.0 - self.alpha[t]) * self.beta[t]
                     ) ** 0.5
                     current_sample += sigma * noise
-
+                    # print('    current_sample2:', current_sample.shape, torch.isinf(current_sample).sum())
             imputed_samples[:, i] = current_sample.detach()
+            del current_sample
+        # print('    imputed_samples2:', imputed_samples.shape, torch.isinf(imputed_samples).sum()) 
         return imputed_samples
 
-    def forward(self, batch, is_train=1, task='pretraining', normalize_for_ad=False):
+    def forward(self, batch, is_train=1, task='pretraining', normalize_for_ad=False, nowcast_cols=None):
         ## is_train = 1 for pretraining and for finetuning but task should be specified and = 0 for evaluation
         
         (
@@ -242,10 +252,15 @@ class TSDE_base(nn.Module):
                 cond_mask = interpolation_mask_batch(observed_mask)
             elif task == 'Imputation with pattern':
                 cond_mask = pattern_mask_batch(observed_mask)
+            # elif task == 'Forecasting':
+            #     cond_mask = gt_mask
             elif task == 'Forecasting':
-                cond_mask = gt_mask
+                cond_mask = forecasting_mask_batch(observed_mask, nowcast_cols)
             else:
                 print('Please choose the right masking to be applied during finetuning')
+
+        if nowcast_cols is not None:
+            cond_mask[:, -nowcast_cols:, :] = 1
 
         if normalize_for_ad:
             ## Normalization from non-stationary Transformer
@@ -376,7 +391,6 @@ class TSDE_base(nn.Module):
             _,
             labels
         ) = self.process_data(batch, sample_feat=self.sample_feat, train=False)
-
         with torch.no_grad():
             cond_mask = gt_mask
             target_mask = observed_mask - cond_mask
@@ -391,8 +405,8 @@ class TSDE_base(nn.Module):
 
             x_co = (cond_mask * observed_data).unsqueeze(1)
             mts_emb = self.get_mts_emb(observed_tp, cond_mask, x_co, feature_id)
-
             samples = self.impute(observed_data, cond_mask, mts_emb, n_samples)
+
 
             for i in range(len(cut_length)):  # to avoid double evaluation
                 target_mask[i, ..., 0 : cut_length[i].item()] = 0
@@ -419,11 +433,12 @@ class TSDE_Forecasting(TSDE_base):
         super(TSDE_Forecasting, self).__init__(target_dim, config, device, sample_feat)
 
     def process_data(self, batch, sample_feat, train=True):
-        observed_data = batch["observed_data"].to(self.device).float()
-        observed_mask = batch["observed_mask"].to(self.device).float()
-        observed_tp = batch["timepoints"].to(self.device).float()
-        gt_mask = batch["gt_mask"].to(self.device).float()
-        feature_id = batch["feature_id"].to(self.device).long()
+        observed_data = batch["observed_data"].float().to(self.device)
+        # fix the above to convert to float 32
+        observed_mask = batch["observed_mask"].float().to(self.device)
+        observed_tp = batch["timepoints"].float().to(self.device)
+        gt_mask = batch["gt_mask"].float().to(self.device)
+        feature_id = batch["feature_id"].long().to(self.device)
         observed_data = observed_data.permute(0, 2, 1)
         observed_mask = observed_mask.permute(0, 2, 1)
         gt_mask = gt_mask.permute(0, 2, 1)

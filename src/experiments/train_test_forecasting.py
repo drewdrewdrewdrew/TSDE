@@ -4,7 +4,7 @@ import json
 import yaml
 import os
 import sys
-
+import pandas as pd
 
 root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(root_dir)
@@ -21,6 +21,7 @@ parser.add_argument('--device', default='cuda:0', help='Device for Attack')
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument('--linear', action='store_true', help='Linear mode flag')
 parser.add_argument('--sample_feat', action='store_true', help='Sample feature flag')
+parser.add_argument('--n_nowcast_cols', type=int, default=None, help='number of rightmost columns not to mask for nowcasting')
 
 
 parser.add_argument("--dataset", type=str, default='Electricity')
@@ -43,6 +44,13 @@ print(json.dumps(config, indent=4))
 
 set_seed(args.seed)
 
+if args.dataset == 'euro_all_countries':
+    raw_data = pd.read_pickle(f'./data/euro_all_countries/euro_all_countries/data.pkl')
+    n_dims = raw_data.shape[1]
+    print('input shape:', raw_data.shape)
+
+
+
 if args.dataset == "Electricity": 
     foldername = "./save/Forecasting/" + args.dataset + "/n_samples_" + str(args.nsample) + "_run_" + str(args.run) + '_linear_' + str(args.linear) + '_sample_feat_' + str(args.sample_feat)+"/"
     model = TSDE_Forecasting(config, args.device, target_dim=370, sample_feat=args.sample_feat).to(args.device)
@@ -53,6 +61,36 @@ if args.dataset == "Electricity":
     batch_size=config["train"]["batch_size"],
     device= args.device,
 )
+    
+elif args.dataset == 'euro_AT':
+    foldername = "./save/Forecasting/" + args.dataset + "/n_samples_" + str(args.nsample) + "_run_" + str(args.run) + '_linear_' + str(args.linear) + '_sample_feat_' + str(args.sample_feat)+"/"
+    model = TSDE_Forecasting(config, args.device, target_dim=12, sample_feat=args.sample_feat).to(args.device)
+    train_loader, valid_loader, test_loader, scaler, mean_scaler = get_dataloader_forecasting(
+    dataset_name='euro_AT',
+    train_length=280,
+    valid_length=0,
+    test_length=27,
+    pred_length=3,
+    history_length=12,
+    skip_length=1,
+    batch_size=config["train"]["batch_size"],
+    device= args.device,
+)
+    
+elif args.dataset == 'euro_all_countries':
+    foldername = "./save/Forecasting/" + args.dataset + "/n_samples_" + str(args.nsample) + "_run_" + str(args.run) + '_linear_' + str(args.linear) + '_sample_feat_' + str(args.sample_feat)+"/"
+    model = TSDE_Forecasting(config, args.device, target_dim=n_dims, sample_feat=args.sample_feat).to(args.device)
+    train_loader, valid_loader, test_loader, scaler, mean_scaler, df_indices, raw_df, predict_loader = get_dataloader_forecasting(
+        dataset_name='euro_all_countries',
+        train_length=-1, # not using
+        skip_length=-1, # not using
+        valid_length=3, # hack, we're dividing this by 100 to get a percentage
+        test_length=10, # hack, we're dividing this by 100 to get a percentage
+        pred_length=18,
+        history_length=48,
+        batch_size=config["train"]["batch_size"],
+        device= args.device,
+    )
 
 elif args.dataset == "Solar":
     foldername = "./save/Forecasting/" + args.dataset + "/n_samples_" + str(args.nsample) + "_run_" + str(args.run) + '_linear_' + str(args.linear) + '_sample_feat_' + str(args.sample_feat)+"/"
@@ -115,6 +153,12 @@ os.makedirs(foldername, exist_ok=True)
 with open(foldername + "config.json", "w") as f:
     json.dump(config, f, indent=4)
 
+raw_df.to_pickle(foldername + "raw_df.pkl")
+df_indices.to_pickle(foldername + "df_indices.pkl")
+
+# if a file exists, delete it
+if os.path.exists(foldername + "losses_2.json"):
+    os.remove(foldername + "losses_2.json")
 
 if args.modelfolder == "":
     loss_path = foldername + "/losses.txt"
@@ -131,6 +175,7 @@ if args.modelfolder == "":
         scaler=scaler,
         mean_scaler=mean_scaler,
         eval_epoch_interval=200,
+        nowcast_cols = args.n_nowcast_cols,
     )
     if config["finetuning"]["epochs"]!=0:
         print("Finetuning")
@@ -147,10 +192,13 @@ if args.modelfolder == "":
            valid_loader=valid_loader,
            foldername=foldername,
            mode = 'Forecasting',
+           nowcast_cols = args.n_nowcast_cols,
         )
 
 else:
     model.load_state_dict(torch.load("./save/" + args.modelfolder + "/model.pth", map_location=args.device))
 
-evaluate(model, test_loader, nsample=args.nsample, foldername=foldername, scaler=scaler, mean_scaler=mean_scaler,save_samples = True)
+torch.set_num_threads(1)
+# evaluate(model, test_loader, nsample=args.nsample, foldername=foldername, scaler=scaler, mean_scaler=mean_scaler, save_samples=True)
+evaluate(model, test_loader, 50, foldername=foldername, scaler=scaler, mean_scaler=mean_scaler, save_samples=True)
 

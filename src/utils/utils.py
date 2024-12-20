@@ -9,7 +9,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc
 import torch.nn.functional as F
 from sklearn import metrics
 import time
-
+import json
 
 
 from utils.metrics import calc_quantile_CRPS_sum, calc_quantile_CRPS, save_roc_curve
@@ -71,7 +71,7 @@ def train(
     train_loader,
     valid_loader=None,
     test_loader=None,
-    valid_epoch_interval=5,
+    valid_epoch_interval=1,
     eval_epoch_interval=500,
     foldername="",
     mode = 'pretraining',
@@ -80,12 +80,14 @@ def train(
     nsample=100,
     save_samples = False,
     physionet_classification=False,
-    normalize_for_ad=False
+    normalize_for_ad=False,
+    nowcast_cols=None,
 ):
     optimizer = Adam(model.parameters(), lr=config["lr"], weight_decay=1e-6)
     if foldername != "":
         output_path = foldername + "/model.pth"
         loss_path = foldername + "/losses.txt"
+        loss_path_2 = foldername + "/losses_2.json"
     p1 = int(0.75 * config["epochs"])
     p2 = int(0.9 * config["epochs"])
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
@@ -93,6 +95,7 @@ def train(
     )
 
     best_valid_loss = 1e10
+    val_patience = 0
     for epoch_no in range(config["epochs"]):
         avg_loss = 0
         model.train()
@@ -100,7 +103,7 @@ def train(
             for batch_no, train_batch in enumerate(it, start=1):
                 optimizer.zero_grad()
 
-                loss = model(train_batch,task=mode, normalize_for_ad=normalize_for_ad)
+                loss = model(train_batch, task=mode, normalize_for_ad=normalize_for_ad, nowcast_cols=nowcast_cols)
                 loss.backward()
                 avg_loss += loss.item()
                 optimizer.step()
@@ -115,6 +118,10 @@ def train(
                 ## Save Losses in txt File
                 with open(loss_path, "a") as file:
                     file.write('avg_epoch_loss: '+ str(avg_loss / batch_no) + ", epoch= "+ str(epoch_no) + "\n")
+                # save losses in a json file:
+                loss_dict = {'mode': mode, 'epoch': epoch_no, 'split': 'train', 'loss': avg_loss / batch_no}
+                with open(loss_path_2, 'a') as f:
+                    f.write(json.dumps(loss_dict) + "\n")
             lr_scheduler.step()
         if valid_loader is not None and (epoch_no + 1) % valid_epoch_interval == 0:
             model.eval()
@@ -122,8 +129,10 @@ def train(
             with torch.no_grad():
                 with tqdm(valid_loader, mininterval=5.0, maxinterval=50.0) as it:
                     for batch_no, valid_batch in enumerate(it, start=1):
-                        loss = model(valid_batch, is_train=0, normalize_for_ad=normalize_for_ad)
+
+                        loss = model(valid_batch, task=mode, normalize_for_ad=normalize_for_ad, nowcast_cols=nowcast_cols)                        
                         avg_loss_valid += loss.item()
+                        
                         it.set_postfix(
                             ordered_dict={
                                 "valid_avg_epoch_loss": avg_loss_valid / batch_no,
@@ -131,16 +140,27 @@ def train(
                             },
                             refresh=False,
                         )
+            avg_loss_valid /= batch_no
             if best_valid_loss > avg_loss_valid:
+                val_patience = 0
                 best_valid_loss = avg_loss_valid
                 with open(loss_path, "a") as file:
-                    file.write('best loss is updated to: '+ str(avg_loss_valid / batch_no) + "at epoch= "+ str(epoch_no) + "\n")
+                    file.write('best loss is updated to: '+ str(avg_loss_valid) + "at epoch= "+ str(epoch_no) + "\n")
                 print(
                     "\n best loss is updated to ",
-                    avg_loss_valid / batch_no,
+                    avg_loss_valid,
                     "at",
                     epoch_no,
                 )
+                torch.save(model.state_dict(), output_path)
+            else:
+                val_patience += 1
+
+            # save losses in a json file:
+            loss_dict = {'mode': mode, 'epoch': epoch_no, 'split': 'val', 'loss': avg_loss_valid}
+            with open(loss_path_2, 'a') as f:
+                f.write(json.dumps(loss_dict) + "\n")
+
         
         if mode == 'pretraining' and test_loader is not None and (epoch_no + 1) % eval_epoch_interval == 0:
             current_checkpoint = (epoch_no + 1) // eval_epoch_interval
@@ -157,6 +177,9 @@ def train(
             
             evaluate(model, test_loader, nsample=nsample, scaler=scaler, mean_scaler=mean_scaler, foldername=checkpoint_folder, save_samples = save_samples, physionet_classification=physionet_classification, normalize_for_ad=normalize_for_ad)
 
+        if val_patience == 10:
+            print("Early stopping at epoch: ", epoch_no)
+            break
     if foldername != "":
         torch.save(model.state_dict(), output_path)
 
@@ -199,11 +222,22 @@ def finetune(model,
 
 
 
-def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldername="", save_samples = False, physionet_classification=False, set_type='Train', normalize_for_ad=False):
+def evaluate(model,
+        test_loader,
+        nsample=100,
+        scaler=1,
+        mean_scaler=0,
+        foldername="",
+        save_samples = False,
+        physionet_classification=False,
+        set_type='Train',
+        normalize_for_ad=False,
+    ):
     
     loss_path = foldername + "/losses.txt"
     with torch.no_grad():
         model.eval()
+        sre_total = 0
         mse_total = 0
         mae_total = 0
         evalpoints_total = 0
@@ -221,12 +255,13 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     samples, c_target, eval_points, observed_points, observed_time, labels = output
                 else:
                     samples, c_target, eval_points, observed_points, observed_time = output
-                samples = samples.permute(0, 1, 3, 2)  # (B,nsample,L,K)
-                c_target = c_target.permute(0, 2, 1)  # (B,L,K)
+
+                samples = samples.permute(0, 1, 3, 2) # (B, nsample, L, K)
+                c_target = c_target.permute(0, 2, 1) # (B, L, K)
                 eval_points = eval_points.permute(0, 2, 1)
                 observed_points = observed_points.permute(0, 2, 1)
-                
-                samples_median = samples.median(dim=1)
+
+                samples_median = samples.median(dim=1).values
                 all_target.append(c_target)
                 all_evalpoint.append(eval_points)
                 all_observed_point.append(observed_points)
@@ -236,19 +271,27 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     all_labels.extend(labels.tolist())
 
                 mse_current = (
-                    ((samples_median.values - c_target) * eval_points) ** 2
+                    ((samples_median - c_target) * eval_points) ** 2
                 ) * (scaler ** 2)
                 mae_current = (
-                    torch.abs((samples_median.values - c_target) * eval_points) 
+                    torch.abs((samples_median - c_target) * eval_points) 
                 ) * scaler
+                
+                samples_raw = samples_median * scaler + mean_scaler
+                targets_raw = c_target * scaler + mean_scaler
+                sre_current = (
+                    ((targets_raw - samples_raw) / targets_raw) ** 2
+                ) * eval_points
 
                 mse_total += mse_current.sum().item()
                 mae_total += mae_current.sum().item()
+                sre_total += sre_current.sum().item()
                 evalpoints_total += eval_points.sum().item()
 
                 it.set_postfix(
                     ordered_dict={
                         "rmse_total": np.sqrt(mse_total / evalpoints_total),
+                        "msre_total": sre_total / evalpoints_total,
                         "mae_total": mae_total / evalpoints_total,
                         "batch_no": batch_no,
                     },
@@ -266,13 +309,17 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
             CRPS_sum = calc_quantile_CRPS_sum(
                 all_target, all_generated_samples, all_evalpoint, mean_scaler, scaler
             )
+            print("MSRE:", sre_total / evalpoints_total)
             print("RMSE:", np.sqrt(mse_total / evalpoints_total))
             print("MAE:", mae_total / evalpoints_total)
             print("CRPS:", CRPS)
             print("CRPS-sum:", CRPS_sum)
             print("MSE:", mse_total/evalpoints_total)
 
-            with open(loss_path, "a") as file:
+            # open and add or create a file to save the results
+            # with open(loss_path, "a") as file:
+            with open(loss_path, "a+") as file:
+                file.write("MSRE:"+ str(sre_total / evalpoints_total) + "\n")
                 file.write("RMSE:"+ str(np.sqrt(mse_total / evalpoints_total)) + "\n")
                 file.write("MAE:"+ str(mae_total / evalpoints_total) + "\n")
                 file.write("CRPS:"+ str(CRPS) + "\n")
